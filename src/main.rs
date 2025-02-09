@@ -8,9 +8,9 @@ use windows::{
             GetIpForwardTable, MIB_IPFORWARDTABLE, MIB_IPROUTE_TYPE_DIRECT,
         },
         Networking::WinSock::{
-            bind, closesocket, WSACleanup, WSAGetLastError, WSAIoctl, WSARecv, WSASocketA,
-            WSAStartup, ADDRESS_FAMILY, AF_INET, FIONBIO, IPPROTO_UDP, SOCKADDR, SOCKADDR_IN,
-            SOCKET, WSABUF, WSADATA,
+            bind, closesocket, setsockopt, WSACleanup, WSAGetLastError, WSAIoctl, WSARecv,
+            WSASocketA, WSAStartup, ADDRESS_FAMILY, AF_INET, FIONBIO, IPPROTO_IP, IPPROTO_UDP,
+            IP_TTL, SOCKADDR, SOCKADDR_IN, SOCKET, SOL_SOCKET, SO_BROADCAST, WSABUF, WSADATA,
         },
     },
 };
@@ -44,16 +44,22 @@ fn main() -> Result<(), std::io::Error> {
 
     init_listen_socket()?;
 
+    let mut buffer = [0u8; DEFAULT_BUFFER_SIZE];
+    let mut src = 0;
+
     loop {
-        let (buffer, len, src) = get_broadcast_packet()?;
-        if buffer[len as usize] <= 1 {
+        let buffer_len = buffer.len().try_into().unwrap();
+        let len = get_broadcast_packet(&mut buffer, buffer_len, &mut src)?;
+        if buffer[IP_TTL_POS] <= 1 {
             continue;
         }
 
         let mut payload = [0u8; DEFAULT_BUFFER_SIZE + IP_HEADER_SIZE];
         payload[0..DEFAULT_BUFFER_SIZE].copy_from_slice(&buffer);
-        println!("Received packet from: {}", src);
-        relay_broadcast(payload, (len - IP_HEADER_SIZE as u32) as u16, src);
+
+        println!("Received: {}", src);
+
+        relay_broadcast(&payload, (len - IP_HEADER_SIZE as u32) as u16, src);
     }
 }
 
@@ -64,7 +70,7 @@ fn init_listen_socket() -> Result<(), std::io::Error> {
     let mut addr = SOCKADDR_IN::default();
     addr.sin_family = ADDRESS_FAMILY(AF_INET.0);
     addr.sin_port = 0;
-    addr.sin_addr.S_un.S_addr = 0; // INADDR_ANY
+    addr.sin_addr.S_un.S_addr = LOOPBACK; // INADDR_ANY
     let addr_ptr: *mut SOCKADDR = &mut addr as *mut SOCKADDR_IN as *mut SOCKADDR;
     let addr_len = std::mem::size_of_val(&addr) as i32;
 
@@ -98,26 +104,26 @@ fn handle_error(msg: &str) -> Result<(), std::io::Error> {
     ))
 }
 
-fn get_broadcast_packet() -> Result<([u8; DEFAULT_BUFFER_SIZE], u32, u32), std::io::Error> {
+fn get_broadcast_packet(
+    buffer: &mut [u8; DEFAULT_BUFFER_SIZE],
+    size: u32,
+    src: &mut u32,
+) -> Result<u32, std::io::Error> {
     get_forward_table()?;
+
     let mut flags = 0;
     let mut len = 0;
-    let mut buffer = [0u8; DEFAULT_BUFFER_SIZE];
     let wsa_buf = WSABUF {
-        len: DEFAULT_BUFFER_SIZE as u32,
+        len: size,
         buf: PSTR::from_raw(buffer.as_mut_ptr()),
     };
 
     let socket = LISTEN_SOCKET.lock().unwrap().clone();
 
-    let mut src;
-
     unsafe {
         loop {
             if WSARecv(socket, &[wsa_buf], Some(&mut len), &mut flags, None, None) != 0 {
-                if let Err(e) = handle_error("WSARecv failed") {
-                    return Err(e);
-                }
+                handle_error("WSARecv failed")?;
             }
 
             if (len as usize) < IP_HEADER_SIZE + UDP_HEADER_SIZE
@@ -126,15 +132,21 @@ fn get_broadcast_packet() -> Result<([u8; DEFAULT_BUFFER_SIZE], u32, u32), std::
                 continue;
             }
 
-            src = buffer[IP_SRCADDR_POS] as u32;
-            if find_addr_in_routes(src) {
+            *src = u32::from_ne_bytes([
+                buffer[IP_SRCADDR_POS],
+                buffer[IP_SRCADDR_POS + 1],
+                buffer[IP_SRCADDR_POS + 2],
+                buffer[IP_SRCADDR_POS + 3],
+            ]);
+
+            if find_addr_in_routes(*src) {
                 continue;
             }
 
             break;
         }
     }
-    Ok((buffer, len, src))
+    Ok(len)
 }
 
 fn get_forward_table() -> Result<(), std::io::Error> {
@@ -183,7 +195,7 @@ fn find_addr_in_routes(src: u32) -> bool {
     false
 }
 
-fn relay_broadcast(payload: [u8; DEFAULT_BUFFER_SIZE + IP_HEADER_SIZE], size: u16, src: u32) {
+fn relay_broadcast(payload: &[u8], size: u16, src: u32) {
     let table = FORWARD_TABLE.lock().unwrap().clone();
     for i in 0..(table.dwNumEntries as usize) {
         let row = table.table[i];
@@ -198,17 +210,13 @@ fn relay_broadcast(payload: [u8; DEFAULT_BUFFER_SIZE + IP_HEADER_SIZE], size: u1
             continue;
         }
 
-        if let Err(e) = send_broadcast(src, payload, size) {
+        if let Err(e) = send_broadcast(row.dwForwardNextHop, payload, size) {
             eprintln!("Failed to send broadcast: {:?}", e);
         }
     }
 }
 
-fn send_broadcast(
-    src: u32,
-    payload: [u8; DEFAULT_BUFFER_SIZE + IP_HEADER_SIZE],
-    size: u16,
-) -> Result<(), std::io::Error> {
+fn send_broadcast(src: u32, payload: &[u8], size: u16) -> Result<(), std::io::Error> {
     let socket = create_socket()?;
 
     // Set the socket to non-blocking mode
@@ -228,25 +236,81 @@ fn send_broadcast(
         {
             return handle_error("WSAIoctl failed");
         }
-    }
 
-    let mut addr = SOCKADDR_IN::default();
-    addr.sin_family = ADDRESS_FAMILY(AF_INET.0);
-    addr.sin_port = 0;
-    addr.sin_addr.S_un.S_addr = src;
-    let addr_ptr: *mut SOCKADDR = &mut addr as *mut SOCKADDR_IN as *mut SOCKADDR;
-    let addr_len = std::mem::size_of_val(&addr) as i32;
+        let mut addr = SOCKADDR_IN::default();
+        addr.sin_family = ADDRESS_FAMILY(AF_INET.0);
+        addr.sin_port = 0;
+        addr.sin_addr.S_un.S_addr = src;
+        let addr_ptr: *mut SOCKADDR = &mut addr as *mut SOCKADDR_IN as *mut SOCKADDR;
+        let addr_len = std::mem::size_of_val(&addr) as i32;
 
-    let wsa_buf = WSABUF {
-        len: size as u32,
-        buf: PSTR::from_raw(payload.as_ptr() as *mut u8),
-    };
-
-    unsafe {
-        if WSARecv(socket, &[wsa_buf], Some(&mut 0u32), &mut 0, None, None) != 0 {
-            return handle_error("WSARecv failed");
+        if bind(socket, addr_ptr, addr_len) == -1 {
+            return handle_error("bind failed");
         }
+
+        if setsockopt(socket, SOL_SOCKET, SO_BROADCAST, Some(&[true as u8])) == -1 {
+            closesocket(socket);
+            return handle_error("setsockopt(SO_BROADCAST) failed");
+        }
+
+        if setsockopt(socket, IPPROTO_IP.0, IP_TTL, Some(&[1])) == -1 {
+            closesocket(socket);
+            return handle_error("setsockopt(IP_TTL) failed");
+        }
+
+        let mut dst_addr = SOCKADDR_IN::default();
+        dst_addr.sin_family = ADDRESS_FAMILY(AF_INET.0);
+        dst_addr.sin_port = 0;
+        dst_addr.sin_addr.S_un.S_addr = BROADCAST;
+        let dst_addr_ptr: *mut SOCKADDR = &mut dst_addr as *mut SOCKADDR_IN as *mut SOCKADDR;
+        let dst_addr_len = std::mem::size_of_val(&dst_addr) as i32;
+
+        // let wsa_buf = WSABUF {
+        //     len: size as u32,
+        //     buf: PSTR::from_raw(payload.clone().as_mut_ptr() as *mut u8),
+        // };
     }
 
     Ok(())
+}
+
+fn compute_udp_checksum(payload: &mut [u8], src_address: u32, dst_address: u32) {
+    todo!("compute_udp_checksum");
+    let mut checksum: u32 = 0;
+    let mut length = payload.len();
+    let mut buf = payload.chunks_exact(2);
+
+    payload[6] = 0;
+    payload[7] = 0;
+
+    for chunk in &mut buf {
+        let word = u16::from_be_bytes([chunk[0], chunk[1]]);
+        checksum += word as u32;
+        if checksum & 0x80000000 != 0 {
+            checksum = (checksum & 0xFFFF) + (checksum >> 16);
+        }
+        length -= 2;
+    }
+
+    if length & 1 != 0 {
+        checksum += payload[payload.len() - 1] as u32;
+    }
+
+    let src = src_address.to_be_bytes();
+    let dst = dst_address.to_be_bytes();
+
+    checksum += u16::from_be_bytes([src[0], src[1]]) as u32;
+    checksum += u16::from_be_bytes([src[2], src[3]]) as u32;
+    checksum += u16::from_be_bytes([dst[0], dst[1]]) as u32;
+    checksum += u16::from_be_bytes([dst[2], dst[3]]) as u32;
+
+    checksum += (17 as u16).to_be() as u32; // IPPROTO_UDP
+    checksum += (payload.len() as u16).to_be() as u32;
+
+    while checksum >> 16 != 0 {
+        checksum = (checksum & 0xFFFF) + (checksum >> 16);
+    }
+
+    let checksum = !(checksum as u16).to_be();
+    payload[6..8].copy_from_slice(&checksum.to_be_bytes());
 }

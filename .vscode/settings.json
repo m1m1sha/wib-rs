@@ -1,11 +1,15 @@
 {
   "cSpell.words": [
+    "closesocket",
+    "DSTADDR",
     "FIONBIO",
     "MIB_IPFORWARDROW",
     "MIB_IPFORWARDTABLE",
     "PSTR",
+    "setsockopt",
     "SOCKADDR",
     "SOCKADDR_IN",
+    "SRCADDR",
     "WSABUF",
     "WSADATA"
   ]
