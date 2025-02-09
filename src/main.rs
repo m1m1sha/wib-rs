@@ -3,7 +3,7 @@ use std::sync::Mutex;
 use windows::{
     core::PSTR,
     Win32::{
-        Foundation::{ERROR_BUFFER_OVERFLOW, NO_ERROR},
+        Foundation::{ERROR_BUFFER_OVERFLOW, ERROR_INSUFFICIENT_BUFFER, NO_ERROR},
         NetworkManagement::IpHelper::{
             GetIpForwardTable, MIB_IPFORWARDTABLE, MIB_IPROUTE_TYPE_DIRECT,
         },
@@ -40,7 +40,6 @@ fn main() -> Result<(), std::io::Error> {
                 "WSAStartup failed",
             ));
         }
-        println!("WSAStartup succeeded");
     }
 
     init_listen_socket()?;
@@ -53,47 +52,54 @@ fn main() -> Result<(), std::io::Error> {
 
         let mut payload = [0u8; DEFAULT_BUFFER_SIZE + IP_HEADER_SIZE];
         payload[0..DEFAULT_BUFFER_SIZE].copy_from_slice(&buffer);
-
+        println!("Received packet from: {}", src);
         relay_broadcast(payload, (len - IP_HEADER_SIZE as u32) as u16, src);
     }
 }
 
 fn init_listen_socket() -> Result<(), std::io::Error> {
+    let socket = create_socket()?;
+    *LISTEN_SOCKET.lock().unwrap() = socket;
+
+    let mut addr = SOCKADDR_IN::default();
+    addr.sin_family = ADDRESS_FAMILY(AF_INET.0);
+    addr.sin_port = 0;
+    addr.sin_addr.S_un.S_addr = 0; // INADDR_ANY
+    let addr_ptr: *mut SOCKADDR = &mut addr as *mut SOCKADDR_IN as *mut SOCKADDR;
+    let addr_len = std::mem::size_of_val(&addr) as i32;
+
+    if unsafe { bind(socket, addr_ptr, addr_len) } == -1 {
+        return handle_error("bind failed");
+    }
+
+    Ok(())
+}
+
+fn create_socket() -> Result<SOCKET, std::io::Error> {
     unsafe {
-        if let Ok(socket) = WSASocketA(AF_INET.0.into(), 3, IPPROTO_UDP.0, None, 0, 0) {
-            *LISTEN_SOCKET.lock().unwrap() = socket;
-            println!("WSASocketA succeeded");
-        } else {
+        let socket = WSASocketA(AF_INET.0.into(), 3, IPPROTO_UDP.0, None, 0, 0)?;
+        if socket.is_invalid() {
+            closesocket(socket);
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
                 "WSASocketA failed",
             ));
         }
-
-        let mut addr = SOCKADDR_IN::default();
-        addr.sin_family = ADDRESS_FAMILY(AF_INET.0);
-        addr.sin_port = 0;
-        addr.sin_addr.S_un.S_addr = LOOPBACK;
-        let addr_ptr: *mut SOCKADDR = &mut addr as *mut SOCKADDR_IN as *mut SOCKADDR;
-        let addr_len = std::mem::size_of_val(&addr) as i32;
-        let socket = LISTEN_SOCKET.lock().unwrap().clone();
-
-        if bind(socket, addr_ptr, addr_len) == -1 {
-            let error = WSAGetLastError();
-            WSACleanup();
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("bind failed with error: {:?}", error),
-            ));
-        }
-
-        Ok(())
+        Ok(socket)
     }
+}
+
+fn handle_error(msg: &str) -> Result<(), std::io::Error> {
+    let error = unsafe { WSAGetLastError() };
+    unsafe { WSACleanup() };
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Other,
+        format!("{} with error: {:?}", msg, error),
+    ))
 }
 
 fn get_broadcast_packet() -> Result<([u8; DEFAULT_BUFFER_SIZE], u32, u32), std::io::Error> {
     get_forward_table()?;
-
     let mut flags = 0;
     let mut len = 0;
     let mut buffer = [0u8; DEFAULT_BUFFER_SIZE];
@@ -109,12 +115,9 @@ fn get_broadcast_packet() -> Result<([u8; DEFAULT_BUFFER_SIZE], u32, u32), std::
     unsafe {
         loop {
             if WSARecv(socket, &[wsa_buf], Some(&mut len), &mut flags, None, None) != 0 {
-                let error = WSAGetLastError();
-                WSACleanup();
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("WSARecv failed with error: {:?}", error),
-                ));
+                if let Err(e) = handle_error("WSARecv failed") {
+                    return Err(e);
+                }
             }
 
             if (len as usize) < IP_HEADER_SIZE + UDP_HEADER_SIZE
@@ -138,28 +141,27 @@ fn get_forward_table() -> Result<(), std::io::Error> {
     unsafe {
         let mut table_size: u32 = 0;
 
-        loop {
-            let result = GetIpForwardTable(
-                Some(&mut *FORWARD_TABLE.lock().unwrap()),
-                &mut table_size,
-                false,
-            );
-            if result == NO_ERROR.0 {
-                break;
-            } else if result == ERROR_BUFFER_OVERFLOW.0 {
-                let mut table_vec: Vec<u8> = Vec::with_capacity(table_size as usize);
-                *FORWARD_TABLE.lock().unwrap() =
-                    *(table_vec.as_mut_ptr() as *mut MIB_IPFORWARDTABLE);
-
-                table_vec.set_len(table_size as usize / std::mem::size_of::<MIB_IPFORWARDTABLE>());
-            } else {
-                WSACleanup();
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("GetIpForwardTable failed with code: {:?}", result),
-                ));
-            }
+        // First call to get the required buffer size
+        let result = GetIpForwardTable(None, &mut table_size, false);
+        // todo!("ERROR_INSUFFICIENT_BUFFER");
+        if result != ERROR_BUFFER_OVERFLOW.0 && result != ERROR_INSUFFICIENT_BUFFER.0 {
+            return handle_error("GetIpForwardTable failed to get buffer size");
         }
+
+        // Allocate the buffer with the required size
+        let mut table_vec: Vec<u8> = vec![0; table_size as usize];
+
+        // Second call to get the actual data
+        let result = GetIpForwardTable(
+            Some(&mut *(table_vec.as_mut_ptr() as *mut MIB_IPFORWARDTABLE)),
+            &mut table_size,
+            false,
+        );
+        if result != NO_ERROR.0 {
+            return handle_error("GetIpForwardTable failed to get data");
+        }
+
+        *FORWARD_TABLE.lock().unwrap() = *(table_vec.as_ptr() as *const MIB_IPFORWARDTABLE);
 
         Ok(())
     }
@@ -178,7 +180,7 @@ fn find_addr_in_routes(src: u32) -> bool {
 
         return row.dwForwardNextHop == src;
     }
-    return false;
+    false
 }
 
 fn relay_broadcast(payload: [u8; DEFAULT_BUFFER_SIZE + IP_HEADER_SIZE], size: u16, src: u32) {
@@ -196,7 +198,9 @@ fn relay_broadcast(payload: [u8; DEFAULT_BUFFER_SIZE + IP_HEADER_SIZE], size: u1
             continue;
         }
 
-        send_broadcast(src, payload, size);
+        if let Err(e) = send_broadcast(src, payload, size) {
+            eprintln!("Failed to send broadcast: {:?}", e);
+        }
     }
 }
 
@@ -205,31 +209,44 @@ fn send_broadcast(
     payload: [u8; DEFAULT_BUFFER_SIZE + IP_HEADER_SIZE],
     size: u16,
 ) -> Result<(), std::io::Error> {
-    // todo!();
+    let socket = create_socket()?;
+
+    // Set the socket to non-blocking mode
+    unsafe {
+        let mut len = 0u32;
+        if WSAIoctl(
+            socket,
+            FIONBIO as u32,
+            None,
+            0,
+            None,
+            0,
+            &mut len,
+            None,
+            None,
+        ) != 0
+        {
+            return handle_error("WSAIoctl failed");
+        }
+    }
+
+    let mut addr = SOCKADDR_IN::default();
+    addr.sin_family = ADDRESS_FAMILY(AF_INET.0);
+    addr.sin_port = 0;
+    addr.sin_addr.S_un.S_addr = src;
+    let addr_ptr: *mut SOCKADDR = &mut addr as *mut SOCKADDR_IN as *mut SOCKADDR;
+    let addr_len = std::mem::size_of_val(&addr) as i32;
+
+    let wsa_buf = WSABUF {
+        len: size as u32,
+        buf: PSTR::from_raw(payload.as_ptr() as *mut u8),
+    };
 
     unsafe {
-        println!("send broadcast");
-
-        let socket = if let Ok(socket) = WSASocketA(AF_INET.0.into(), 3, IPPROTO_UDP.0, None, 0, 0)
-        {
-            if socket.is_invalid() {
-                closesocket(socket);
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "WSASocketA failed",
-                ));
-            }
-            socket
-        } else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "WSASocketA failed",
-            ));
-        };
-
-        let mut len = 0u32;
-        // WSAIoctl(socket, FIONBIO, None, 0, None, 0, &mut len, None, None);
-        todo!("relay");
-        Ok(())
+        if WSARecv(socket, &[wsa_buf], Some(&mut 0u32), &mut 0, None, None) != 0 {
+            return handle_error("WSARecv failed");
+        }
     }
+
+    Ok(())
 }
