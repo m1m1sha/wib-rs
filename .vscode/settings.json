@@ -3,6 +3,7 @@
     "closesocket",
     "DSTADDR",
     "FIONBIO",
+    "htons",
     "MIB_IPFORWARDROW",
     "MIB_IPFORWARDTABLE",
     "PSTR",

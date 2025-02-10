@@ -1,5 +1,5 @@
 use once_cell::sync::Lazy;
-use std::sync::Mutex;
+use std::{ptr, sync::Mutex};
 use windows::{
     core::PSTR,
     Win32::{
@@ -9,8 +9,9 @@ use windows::{
         },
         Networking::WinSock::{
             bind, closesocket, setsockopt, WSACleanup, WSAGetLastError, WSAIoctl, WSARecv,
-            WSASocketA, WSAStartup, ADDRESS_FAMILY, AF_INET, FIONBIO, IPPROTO_IP, IPPROTO_UDP,
-            IP_TTL, SOCKADDR, SOCKADDR_IN, SOCKET, SOL_SOCKET, SO_BROADCAST, WSABUF, WSADATA,
+            WSASendTo, WSASocketA, WSAStartup, ADDRESS_FAMILY, AF_INET, FIONBIO, IPPROTO_IP,
+            IPPROTO_UDP, IP_TTL, SOCKADDR, SOCKADDR_IN, SOCKET, SOL_SOCKET, SO_BROADCAST, WSABUF,
+            WSADATA,
         },
     },
 };
@@ -59,7 +60,7 @@ fn main() -> Result<(), std::io::Error> {
 
         println!("Received: {}", src);
 
-        relay_broadcast(&payload, (len - IP_HEADER_SIZE as u32) as u16, src);
+        relay_broadcast(&mut payload, (len - IP_HEADER_SIZE as u32) as u16, src);
     }
 }
 
@@ -75,7 +76,7 @@ fn init_listen_socket() -> Result<(), std::io::Error> {
     let addr_len = std::mem::size_of_val(&addr) as i32;
 
     if unsafe { bind(socket, addr_ptr, addr_len) } == -1 {
-        return handle_error("bind failed");
+        return handle_error("init bind failed");
     }
 
     Ok(())
@@ -195,7 +196,7 @@ fn find_addr_in_routes(src: u32) -> bool {
     false
 }
 
-fn relay_broadcast(payload: &[u8], size: u16, src: u32) {
+fn relay_broadcast(payload: &mut [u8], size: u16, src: u32) {
     let table = FORWARD_TABLE.lock().unwrap().clone();
     for i in 0..(table.dwNumEntries as usize) {
         let row = table.table[i];
@@ -216,7 +217,7 @@ fn relay_broadcast(payload: &[u8], size: u16, src: u32) {
     }
 }
 
-fn send_broadcast(src: u32, payload: &[u8], size: u16) -> Result<(), std::io::Error> {
+fn send_broadcast(src: u32, payload: &mut [u8], size: u16) -> Result<(), std::io::Error> {
     let socket = create_socket()?;
 
     // Set the socket to non-blocking mode
@@ -245,7 +246,7 @@ fn send_broadcast(src: u32, payload: &[u8], size: u16) -> Result<(), std::io::Er
         let addr_len = std::mem::size_of_val(&addr) as i32;
 
         if bind(socket, addr_ptr, addr_len) == -1 {
-            return handle_error("bind failed");
+            return handle_error("send bind failed");
         }
 
         if setsockopt(socket, SOL_SOCKET, SO_BROADCAST, Some(&[true as u8])) == -1 {
@@ -265,27 +266,49 @@ fn send_broadcast(src: u32, payload: &[u8], size: u16) -> Result<(), std::io::Er
         let dst_addr_ptr: *mut SOCKADDR = &mut dst_addr as *mut SOCKADDR_IN as *mut SOCKADDR;
         let dst_addr_len = std::mem::size_of_val(&dst_addr) as i32;
 
-        // let wsa_buf = WSABUF {
-        //     len: size as u32,
-        //     buf: PSTR::from_raw(payload.clone().as_mut_ptr() as *mut u8),
-        // };
+        compute_udp_checksum(payload, size, src, BROADCAST);
+
+        let wsa_buf = WSABUF {
+            len: size as u32,
+            buf: PSTR::from_raw(payload.as_mut_ptr() as *mut u8),
+        };
+
+        if WSASendTo(
+            socket,
+            &[wsa_buf],
+            Some(&mut len),
+            0,
+            Some(dst_addr_ptr),
+            dst_addr_len,
+            None,
+            None,
+        ) != 0
+        {
+            closesocket(socket);
+            return handle_error("WSASendTo failed");
+        }
+
+        closesocket(socket);
     }
 
     Ok(())
 }
 
-fn compute_udp_checksum(payload: &mut [u8], src_address: u32, dst_address: u32) {
-    todo!("compute_udp_checksum");
+fn compute_udp_checksum(payload: &mut [u8], size: u16, src: u32, dst: u32) {
+    let mut buf = payload.as_ptr() as *const u16;
+    let mut length = size;
+    let src = src.to_be_bytes();
+    let dst = dst.to_be_bytes();
     let mut checksum: u32 = 0;
-    let mut length = payload.len();
-    let mut buf = payload.chunks_exact(2);
 
-    payload[6] = 0;
-    payload[7] = 0;
+    payload[UDP_CHECKSUM_POS] = 0;
 
-    for chunk in &mut buf {
-        let word = u16::from_be_bytes([chunk[0], chunk[1]]);
-        checksum += word as u32;
+    // Calculate the checksum
+    while length > 1 {
+        unsafe {
+            checksum += ptr::read(buf) as u32;
+            buf = buf.add(1);
+        }
         if checksum & 0x80000000 != 0 {
             checksum = (checksum & 0xFFFF) + (checksum >> 16);
         }
@@ -293,24 +316,26 @@ fn compute_udp_checksum(payload: &mut [u8], src_address: u32, dst_address: u32) 
     }
 
     if length & 1 != 0 {
-        checksum += payload[payload.len() - 1] as u32;
+        unsafe {
+            checksum += *(buf as *const u8) as u32;
+        }
     }
-
-    let src = src_address.to_be_bytes();
-    let dst = dst_address.to_be_bytes();
 
     checksum += u16::from_be_bytes([src[0], src[1]]) as u32;
     checksum += u16::from_be_bytes([src[2], src[3]]) as u32;
     checksum += u16::from_be_bytes([dst[0], dst[1]]) as u32;
     checksum += u16::from_be_bytes([dst[2], dst[3]]) as u32;
 
-    checksum += (17 as u16).to_be() as u32; // IPPROTO_UDP
-    checksum += (payload.len() as u16).to_be() as u32;
+    checksum += (IPPROTO_UDP.0 as u32).to_be();
+    checksum += (size as u32).to_be();
 
     while checksum >> 16 != 0 {
         checksum = (checksum & 0xFFFF) + (checksum >> 16);
     }
 
-    let checksum = !(checksum as u16).to_be();
-    payload[6..8].copy_from_slice(&checksum.to_be_bytes());
+    let checksum = checksum.to_be_bytes();
+    payload[UDP_CHECKSUM_POS] = checksum[0];
+    payload[UDP_CHECKSUM_POS + 1] = checksum[1];
+    payload[UDP_CHECKSUM_POS + 2] = checksum[2];
+    payload[UDP_CHECKSUM_POS + 3] = checksum[3];
 }
