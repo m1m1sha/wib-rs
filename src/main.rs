@@ -1,5 +1,5 @@
 use once_cell::sync::Lazy;
-use std::{ptr, sync::Mutex};
+use std::{net::Ipv4Addr, ptr, sync::Mutex};
 use windows::{
     core::PSTR,
     Win32::{
@@ -44,13 +44,15 @@ fn main() -> Result<(), std::io::Error> {
     }
 
     init_listen_socket()?;
+    println!("Listening...");
 
     let mut buffer = [0u8; DEFAULT_BUFFER_SIZE];
     let mut src = 0;
-
     loop {
         let buffer_len = buffer.len().try_into().unwrap();
         let len = get_broadcast_packet(&mut buffer, buffer_len, &mut src)?;
+        println!("R: {}", Ipv4Addr::from_bits(src.clone()));
+        println!("Buffer: {:?}", buffer);
         if buffer[IP_TTL_POS] <= 1 {
             continue;
         }
@@ -71,7 +73,7 @@ fn init_listen_socket() -> Result<(), std::io::Error> {
     let mut addr = SOCKADDR_IN::default();
     addr.sin_family = ADDRESS_FAMILY(AF_INET.0);
     addr.sin_port = 0;
-    addr.sin_addr.S_un.S_addr = LOOPBACK; // INADDR_ANY
+    addr.sin_addr.S_un.S_addr = LOOPBACK;
     let addr_ptr: *mut SOCKADDR = &mut addr as *mut SOCKADDR_IN as *mut SOCKADDR;
     let addr_len = std::mem::size_of_val(&addr) as i32;
 
@@ -111,7 +113,6 @@ fn get_broadcast_packet(
     src: &mut u32,
 ) -> Result<u32, std::io::Error> {
     get_forward_table()?;
-
     let mut flags = 0;
     let mut len = 0;
     let wsa_buf = WSABUF {
@@ -125,21 +126,29 @@ fn get_broadcast_packet(
         loop {
             if WSARecv(socket, &[wsa_buf], Some(&mut len), &mut flags, None, None) != 0 {
                 handle_error("WSARecv failed")?;
+                break;
             }
 
-            if (len as usize) < IP_HEADER_SIZE + UDP_HEADER_SIZE
-                || buffer[IP_DSTADDR_POS] as u32 != BROADCAST
-            {
+            let from = u32::from_be_bytes([
+                buffer[IP_DSTADDR_POS],
+                buffer[IP_DSTADDR_POS + 1],
+                buffer[IP_DSTADDR_POS + 2],
+                buffer[IP_DSTADDR_POS + 3],
+            ]);
+
+            println!("wsaR: {}, {}", len, Ipv4Addr::from_bits(from));
+            // println!("get Buffer: {:?}", buffer);
+            if (len as usize) < IP_HEADER_SIZE + UDP_HEADER_SIZE || from != BROADCAST {
                 continue;
             }
-
-            *src = u32::from_ne_bytes([
+            println!("R: {}", Ipv4Addr::from_bits(src.clone()));
+            *src = u32::from_be_bytes([
                 buffer[IP_SRCADDR_POS],
                 buffer[IP_SRCADDR_POS + 1],
                 buffer[IP_SRCADDR_POS + 2],
                 buffer[IP_SRCADDR_POS + 3],
             ]);
-
+            println!("R: {}", Ipv4Addr::from_bits(src.clone()));
             if find_addr_in_routes(*src) {
                 continue;
             }
@@ -182,6 +191,7 @@ fn get_forward_table() -> Result<(), std::io::Error> {
 
 fn find_addr_in_routes(src: u32) -> bool {
     let table = FORWARD_TABLE.lock().unwrap().clone();
+    println!("find: {}, {}", table.dwNumEntries, table.table.len());
     for i in 0..(table.dwNumEntries as usize) {
         let row = table.table[i];
         if row.dwForwardDest != BROADCAST
