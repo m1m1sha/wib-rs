@@ -17,7 +17,7 @@ use windows::{
 };
 
 static WSA_VERSION: u16 = 0x0202; // 2.2
-static LOOPBACK: u32 = 0x7f_00_00_01; // 127.0.0.1
+static LOOPBACK: u32 = 0x01_00_00_7F; // 127.0.0.1
 static BROADCAST: u32 = 0xff_ff_ff_ff; // 255.255.255.255
 static LISTEN_SOCKET: Lazy<Mutex<SOCKET>> = Lazy::new(|| Mutex::new(SOCKET::default()));
 static FORWARD_TABLE: Lazy<Mutex<MIB_IPFORWARDTABLE>> =
